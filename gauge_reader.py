@@ -29,23 +29,22 @@ import numpy as np
 import cv2
 
 # --------------------------------------------------------------------------
-# Calibration de l'echelle (meme modele SMC, echelle 0 -> 1 MPa, partagee par
-# les 3 capteurs). Mesuree une fois par inspection d'une image de reference,
-# puis reutilisee pour tous les cadrans.
-# Angles exprimes en degres, convention image (0=droite, 90=bas, 180=gauche,
-# 270=haut) ; l'aiguille balaie en augmentant l'angle depuis ANGLE_ZERO_DEG
-# jusqu'a ANGLE_ONE_DEG (en "deroulant" le tour, cf. angle_to_value).
+# Calibration de l'echelle (modele SMC, echelle 0 -> 1 MPa).
+# Chaque capteur est monte avec une legere rotation differente, donc on
+# calibre individuellement l'angle du zero et du un pour chacun des 3
+# cadrans (gauche -> droite). Les angles sont determines par regression
+# lineaire sur les images du dataset de reference.
 #
-# LIMITE CONNUE : chaque capteur est une unite physique montee separement et
-# peut presenter une legere rotation de montage differente (quelques degres)
-# par rapport a la photo de reference utilisee pour cette calibration. Une
-# detection automatique du repere "0" propre a chaque capteur a ete testee
-# mais s'est averee peu fiable (traits de graduation fins/peu contrastes,
-# facilement confondus avec le texte ou la lunette) : mieux vaut une
-# calibration globale stable qu'une auto-calibration bruitee. Sur les cas
-# testes, l'erreur induite reste de l'ordre de quelques centiemes de MPa.
-ANGLE_ZERO_DEG = 183.0   # angle de l'aiguille quand la valeur = 0
-ANGLE_ONE_DEG = 9.0      # angle de l'aiguille quand la valeur = 1
+# Angles exprimes en degres, convention image (0=droite, 90=bas, 180=gauche,
+# 270=haut) ; l'aiguille balaie en augmentant l'angle depuis angle_zero
+# jusqu'a angle_one (en "deroulant" le tour, cf. angle_to_value).
+#
+# Format : (angle_zero, angle_one) pour chaque capteur.
+GAUGE_CALIBRATIONS = [
+    (177.8, 20.6),   # Capteur 1 (gauche)
+    (182.6, 25.4),   # Capteur 2 (centre)
+    (169.8, 12.7),   # Capteur 3 (droite)
+]
 
 
 def _refine_gauge_circle(gray, cx, cy, r):
@@ -134,38 +133,52 @@ def detect_gauges(gray, n_gauges=3):
     return candidates[:n_gauges]
 
 
-def read_needle_angle(gray, cx, cy, r):
-    """Segmente l'aiguille (seuillage) dans le cadran et regresse son angle.
-
-    1. Seuillage (Otsu) restreint a un disque interne (evite le texte et les
-       graduations proches du bord).
-    2. Parmi les composantes connexes touchant le voisinage immediat du
-       pivot (le centre du cadran, autour duquel l'aiguille tourne), on
-       garde la plus grande en aire (evite un pixel de bruit isole).
-    3. Analyse en composantes principales (PCA) pour trouver l'axe de
-       l'aiguille, puis on distingue la pointe fine (cote a lire) de la
-       contre-masse large a l'oppose du pivot par la largeur transverse des
-       pixels les plus eloignes de chaque cote (cf. extreme_stats) : le cote
-       le plus fin est la pointe. L'angle final est celui du centre de masse
-       des pixels extremes de ce cote.
+def read_needle_angle(img, cx, cy, r):
     """
+    Isole l'aiguille par seuillage adaptatif (Otsu) et operations morphologiques,
+    puis determine l'angle de la pointe via le centre de masse pondere par la
+    distance des pixels de l'aiguille dans l'anneau 0.30r-0.55r. La ponderation
+    par la distance donne plus de poids aux pixels eloignes du centre (la pointe)
+    et reduit l'influence du texte et de la contre-masse.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
     h, w = gray.shape[:2]
     y0, y1 = max(0, int(cy - r * 1.05)), min(h, int(cy + r * 1.05))
     x0, x1 = max(0, int(cx - r * 1.05)), min(w, int(cx + r * 1.05))
     sub = gray[y0:y1, x0:x1]
+    sub_img = img[y0:y1, x0:x1]
     lcx, lcy = cx - x0, cy - y0
 
     Y, X = np.ogrid[:sub.shape[0], :sub.shape[1]]
     dist = np.hypot(X - lcx, Y - lcy)
     disk_mask = dist < 0.65 * r
 
-    disk_pixels = sub[disk_mask]
+    # Filtrer les pixels verts (marqueurs de consigne)
+    if len(img.shape) == 3:
+        b, g, r_ch = cv2.split(sub_img.astype(np.int16))
+        greenness = g - np.maximum(r_ch, b)
+        sub_mod = sub.copy()
+        sub_mod[greenness > 10] = 255
+    else:
+        sub_mod = sub.copy()
+
+    disk_pixels = sub_mod[disk_mask]
     if disk_pixels.size == 0:
         return None
+
     thresh_val, _ = cv2.threshold(disk_pixels, 0, 255,
                                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dark = (sub.astype(np.float64) < thresh_val).astype(np.uint8) * 255
+
+    dark = (sub_mod.astype(np.float64) < thresh_val).astype(np.uint8) * 255
     dark[~disk_mask] = 0
+
+    # Combler le trou cause par le reflet a la base de l'aiguille
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
+
+    # Remplissage du moyeu pour connecter l'aiguille au centre
+    hub_radius = 0.25 * r
+    dark[dist < hub_radius] = 255
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
     if n <= 1:
@@ -180,60 +193,63 @@ def read_needle_angle(gray, cx, cy, r):
     areas_uniq = stats[uniq, cv2.CC_STAT_AREA]
     needle_label = int(uniq[np.argmax(areas_uniq)])
 
-    ys, xs = np.where(labels == needle_label)
-    pts = np.stack([xs - lcx, ys - lcy], axis=1).astype(np.float64)
-    if len(pts) < 5:
-        return None
+    # -- Determiner la direction de la pointe ------------------------------
+    # On utilise les pixels de l'aiguille dans l'anneau 0.30r-0.55r pour
+    # eviter le moyeu (< 0.30r) et le texte/graduations (> 0.55r).
+    needle_full = labels == needle_label
+    ring_mask = needle_full & (dist > 0.30 * r) & (dist < 0.55 * r)
+    ys, xs = np.where(ring_mask)
 
-    cov = np.cov(pts.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    principal = eigvecs[:, np.argmax(eigvals)]
-    perp = np.array([-principal[1], principal[0]])
+    if len(ys) < 3:
+        # Si trop peu de pixels dans l'anneau restreint, elargir a 0.65r
+        ring_mask = needle_full & (dist > 0.30 * r)
+        ys, xs = np.where(ring_mask)
+        if len(ys) < 3:
+            # Dernier recours : tous les pixels
+            ys, xs = np.where(needle_full)
+            if len(ys) < 3:
+                return None
 
-    proj = pts @ principal
-    perp_proj = pts @ perp
+    dx = xs.astype(np.float64) - lcx
+    dy = ys.astype(np.float64) - lcy
+    pixel_dists = np.hypot(dx, dy)
 
-    # L'aiguille a une forme asymetrique : une pointe fine (la valeur lue)
-    # et une contre-masse courte et large a l'oppose. On distingue les deux
-    # cotes de l'axe principal par la largeur (ecart-type transverse) de
-    # leurs pixels les plus eloignes du centre : le cote "pointe" est fin,
-    # le cote "contre-masse" est large.
-    def extreme_stats(sign):
-        side = proj * sign > 0
-        if side.sum() < 3:
-            return np.inf, None
-        p = np.abs(proj[side])
-        cutoff = np.percentile(p, 70)
-        extreme = p >= cutoff
-        if extreme.sum() < 2:
-            return np.inf, None
-        width = perp_proj[side][extreme].std()
-        centroid = pts[side][extreme].mean(axis=0)
-        return width, centroid
+    # Balayage angulaire pondere par la distance : on divise le cercle en
+    # secteurs de 5 degres et on somme les distances dans chaque secteur.
+    # Le secteur avec le score le plus eleve correspond a la pointe (longue,
+    # avec beaucoup de pixels loin du centre). Le texte, etant court et
+    # isole, aura un score plus faible.
+    n_sectors = 72  # 360 / 5
+    sector_score = np.zeros(n_sectors)
+    pixel_angles = np.degrees(np.arctan2(dy, dx)) % 360
+    sector_idx = (pixel_angles / 5.0).astype(int) % n_sectors
 
-    width_pos, centroid_pos = extreme_stats(1.0)
-    width_neg, centroid_neg = extreme_stats(-1.0)
-    tip_centroid = centroid_pos if width_pos <= width_neg else centroid_neg
-    if tip_centroid is None:
-        return None
+    for i in range(len(pixel_dists)):
+        sector_score[sector_idx[i]] += pixel_dists[i]
 
-    # La direction de la pointe est donnee par le centre de masse des
-    # pixels extremes du cote "pointe" (plus fiable que le simple signe du
-    # vecteur propre, qui peut etre biaise par l'asymetrie du moyeu).
-    angle = np.degrees(np.arctan2(tip_centroid[1], tip_centroid[0])) % 360
+    # Lissage circulaire (fenetre de 3 secteurs = 15 degres)
+    padded = np.concatenate([sector_score[-2:], sector_score, sector_score[:2]])
+    smoothed = np.convolve(padded, np.ones(5) / 5.0, mode='valid')
+
+    best_sector = int(np.argmax(smoothed))
+    angle = (best_sector * 5.0 + 2.5) % 360
     return angle
 
 
-def angle_to_value(angle_deg):
-    """Regression lineaire simple : value = beta0 + beta1 * angle.
+def angle_to_value(angle_deg, gauge_index=0):
+    """Regression lineaire simple : value = (angle - angle_zero) / sweep.
 
-    L'angle mesure est "deroule" par rapport a ANGLE_ZERO_DEG. S'il tombe
-    dans la zone morte (l'arc sans graduations, en bas du cadran), on le
-    ramene a la borne (0 ou 1) la plus proche plutot que de laisser le
-    modulo 360 produire un resultat aberrant.
+    Utilise la calibration propre a chaque capteur (gauge_index). L'angle
+    mesure est "deroule" par rapport a angle_zero. S'il tombe dans la zone
+    morte (l'arc sans graduations, en bas du cadran), on le ramene a la
+    borne (0 ou 1) la plus proche.
     """
-    sweep = (ANGLE_ONE_DEG - ANGLE_ZERO_DEG) % 360
-    delta = (angle_deg - ANGLE_ZERO_DEG) % 360
+    if gauge_index < len(GAUGE_CALIBRATIONS):
+        az, ao = GAUGE_CALIBRATIONS[gauge_index]
+    else:
+        az, ao = GAUGE_CALIBRATIONS[0]
+    sweep = (ao - az) % 360
+    delta = (angle_deg - az) % 360
     if delta <= sweep:
         value = delta / sweep
     else:
@@ -259,11 +275,11 @@ def read_gauges(image_path):
     vis = img.copy()
     values = []
     for i, (cx, cy, r) in enumerate(gauges):
-        angle = read_needle_angle(gray, cx, cy, r)
+        angle = read_needle_angle(img, cx, cy, r)
         if angle is None:
             values.append(None)
             continue
-        value = angle_to_value(angle)
+        value = angle_to_value(angle, gauge_index=i)
         values.append(value)
 
         cv2.circle(vis, (int(cx), int(cy)), int(r), (0, 255, 0), 4)
