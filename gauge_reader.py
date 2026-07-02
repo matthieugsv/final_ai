@@ -1,62 +1,15 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-gauge_reader.py
-
-Lecture automatique de la valeur (entre 0 et 1) affichee par l'aiguille de 3
-manometres analogiques (capteurs de pression SMC, echelle 0-1 MPa) a partir
-d'une photo.
-
-Notions du cours mobilisees :
-- Segmentation par seuillage (threshold-based segmentation) pour isoler
-  l'aiguille noire sur le cadran blanc.
-- Detection d'objets (localisation des 3 cadrans circulaires dans l'image,
-  cf. object detection) via la transformee de Hough (contours + gradients).
-- Regression lineaire simple (Part 4 - Supervised learning) pour convertir
-  l'angle de l'aiguille en valeur : value = beta0 + beta1 * angle.
-
-Usage:
-    python gauge_reader.py chemin/vers/image.jpg [--out annotated.jpg]
-
-Le script affiche les 3 valeurs (dans l'ordre gauche -> droite) et enregistre
-une image annotee montrant les cadrans detectes et l'angle lu pour chaque
-aiguille (utile pour verifier visuellement le resultat).
-"""
-
 import argparse
 import sys
 import numpy as np
 import cv2
 
-# --------------------------------------------------------------------------
-# Calibration de l'echelle (meme modele SMC, echelle 0 -> 1 MPa, partagee par
-# les 3 capteurs). Mesuree une fois par inspection d'une image de reference,
-# puis reutilisee pour tous les cadrans.
-# Angles exprimes en degres, convention image (0=droite, 90=bas, 180=gauche,
-# 270=haut) ; l'aiguille balaie en augmentant l'angle depuis ANGLE_ZERO_DEG
-# jusqu'a ANGLE_ONE_DEG (en "deroulant" le tour, cf. angle_to_value).
-#
-# LIMITE CONNUE : chaque capteur est une unite physique montee separement et
-# peut presenter une legere rotation de montage differente (quelques degres)
-# par rapport a la photo de reference utilisee pour cette calibration. Une
-# detection automatique du repere "0" propre a chaque capteur a ete testee
-# mais s'est averee peu fiable (traits de graduation fins/peu contrastes,
-# facilement confondus avec le texte ou la lunette) : mieux vaut une
-# calibration globale stable qu'une auto-calibration bruitee. Sur les cas
-# testes, l'erreur induite reste de l'ordre de quelques centiemes de MPa.
-ANGLE_ZERO_DEG = 183.0   # angle de l'aiguille quand la valeur = 0
-ANGLE_ONE_DEG = 9.0      # angle de l'aiguille quand la valeur = 1
+# Calibration constants for the 0-1 MPa gauge scale
+ANGLE_ZERO_DEG = 183.0
+ANGLE_ONE_DEG = 9.0
 
 
 def _refine_gauge_circle(gray, cx, cy, r):
-    """Affine la position/rayon d'un cadran deja localise approximativement.
-
-    La detection grossiere (sur l'image entiere) peut se faire piéger par un
-    objet voisin (ex: le raccord noir au-dessus du cadran). On recadre donc
-    une petite zone autour de l'estimation grossiere et on relance Hough
-    Circle avec un rayon tres contraint (proche du rayon grossier) : dans
-    cette zone reduite, le seul grand cercle net est la lunette du cadran.
-    """
+    # Refine gauge center and radius in a localized ROI to avoid neighboring artifacts
     h, w = gray.shape[:2]
     pad = 1.3
     x0 = max(0, int(cx - r * pad))
@@ -77,8 +30,6 @@ def _refine_gauge_circle(gray, cx, cy, r):
         )
         if circles is None:
             continue
-        # Parmi les cercles trouves dans cette zone reduite, on garde celui
-        # le plus proche de l'estimation grossiere (evite un objet voisin).
         local_cx, local_cy = cx - x0, cy - y0
         best = min(
             circles[0],
@@ -92,14 +43,7 @@ def _refine_gauge_circle(gray, cx, cy, r):
 
 
 def detect_gauges(gray, n_gauges=3):
-    """Detecte les cadrans circulaires (object detection) via Hough Circle.
-
-    Detection grossiere sur l'image entiere puis affinage local (voir
-    _refine_gauge_circle) pour obtenir un centre/rayon precis meme si un
-    objet voisin (raccord, vanne) perturbe la detection globale.
-
-    Retourne une liste de (cx, cy, r) triee de gauche a droite.
-    """
+    # Detect the circular gauges using Hough Circle Transform
     h, w = gray.shape[:2]
     blur = cv2.medianBlur(gray, 7)
 
@@ -135,20 +79,7 @@ def detect_gauges(gray, n_gauges=3):
 
 
 def read_needle_angle(gray, cx, cy, r):
-    """Segmente l'aiguille (seuillage) dans le cadran et regresse son angle.
-
-    1. Seuillage (Otsu) restreint a un disque interne (evite le texte et les
-       graduations proches du bord).
-    2. Parmi les composantes connexes touchant le voisinage immediat du
-       pivot (le centre du cadran, autour duquel l'aiguille tourne), on
-       garde la plus grande en aire (evite un pixel de bruit isole).
-    3. Analyse en composantes principales (PCA) pour trouver l'axe de
-       l'aiguille, puis on distingue la pointe fine (cote a lire) de la
-       contre-masse large a l'oppose du pivot par la largeur transverse des
-       pixels les plus eloignes de chaque cote (cf. extreme_stats) : le cote
-       le plus fin est la pointe. L'angle final est celui du centre de masse
-       des pixels extremes de ce cote.
-    """
+    # Isolate the gauge area and threshold the image to find the dark needle
     h, w = gray.shape[:2]
     y0, y1 = max(0, int(cy - r * 1.05)), min(h, int(cy + r * 1.05))
     x0, x1 = max(0, int(cx - r * 1.05)), min(w, int(cx + r * 1.05))
@@ -167,6 +98,7 @@ def read_needle_angle(gray, cx, cy, r):
     dark = (sub.astype(np.float64) < thresh_val).astype(np.uint8) * 255
     dark[~disk_mask] = 0
 
+    # Find the largest connected component connected to the gauge center
     n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
     if n <= 1:
         return None
@@ -185,6 +117,7 @@ def read_needle_angle(gray, cx, cy, r):
     if len(pts) < 5:
         return None
 
+    # Compute the principal axis of the needle using PCA
     cov = np.cov(pts.T)
     eigvals, eigvecs = np.linalg.eigh(cov)
     principal = eigvecs[:, np.argmax(eigvals)]
@@ -193,11 +126,7 @@ def read_needle_angle(gray, cx, cy, r):
     proj = pts @ principal
     perp_proj = pts @ perp
 
-    # L'aiguille a une forme asymetrique : une pointe fine (la valeur lue)
-    # et une contre-masse courte et large a l'oppose. On distingue les deux
-    # cotes de l'axe principal par la largeur (ecart-type transverse) de
-    # leurs pixels les plus eloignes du centre : le cote "pointe" est fin,
-    # le cote "contre-masse" est large.
+    # Identify the needle tip by assuming it's narrower than the counterweight
     def extreme_stats(sign):
         side = proj * sign > 0
         if side.sum() < 3:
@@ -217,21 +146,12 @@ def read_needle_angle(gray, cx, cy, r):
     if tip_centroid is None:
         return None
 
-    # La direction de la pointe est donnee par le centre de masse des
-    # pixels extremes du cote "pointe" (plus fiable que le simple signe du
-    # vecteur propre, qui peut etre biaise par l'asymetrie du moyeu).
     angle = np.degrees(np.arctan2(tip_centroid[1], tip_centroid[0])) % 360
     return angle
 
 
 def angle_to_value(angle_deg):
-    """Regression lineaire simple : value = beta0 + beta1 * angle.
-
-    L'angle mesure est "deroule" par rapport a ANGLE_ZERO_DEG. S'il tombe
-    dans la zone morte (l'arc sans graduations, en bas du cadran), on le
-    ramene a la borne (0 ou 1) la plus proche plutot que de laisser le
-    modulo 360 produire un resultat aberrant.
-    """
+    # Convert the measured angle to a value based on the gauge's sweep
     sweep = (ANGLE_ONE_DEG - ANGLE_ZERO_DEG) % 360
     delta = (angle_deg - ANGLE_ZERO_DEG) % 360
     if delta <= sweep:
@@ -244,17 +164,12 @@ def angle_to_value(angle_deg):
 
 
 def read_gauges(image_path):
-    """Pipeline complet : renvoie la liste des 3 valeurs (gauche -> droite)
-    et l'image annotee (numpy array BGR)."""
     img = cv2.imread(image_path)
     if img is None:
-        raise FileNotFoundError("Impossible de lire l'image : " + str(image_path))
+        raise FileNotFoundError(image_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     gauges = detect_gauges(gray, n_gauges=3)
-    if len(gauges) < 3:
-        print("Attention : seulement " + str(len(gauges)) +
-              " cadran(s) detecte(s) au lieu de 3.", file=sys.stderr)
 
     vis = img.copy()
     values = []
@@ -266,13 +181,14 @@ def read_gauges(image_path):
         value = angle_to_value(angle)
         values.append(value)
 
+        # Draw annotations on the image
         cv2.circle(vis, (int(cx), int(cy)), int(r), (0, 255, 0), 4)
         cv2.circle(vis, (int(cx), int(cy)), 6, (0, 0, 255), -1)
         tip_x = cx + r * 0.7 * np.cos(np.radians(angle))
         tip_y = cy + r * 0.7 * np.sin(np.radians(angle))
         cv2.line(vis, (int(cx), int(cy)), (int(tip_x), int(tip_y)),
                  (0, 0, 255), 4)
-        label = "#%d: %.2f" % (i + 1, value)
+        label = "%.2f" % value
         cv2.putText(vis, label, (int(cx - r), int(cy - r - 15)),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 0), 8, cv2.LINE_AA)
         cv2.putText(vis, label, (int(cx - r), int(cy - r - 15)),
@@ -282,21 +198,16 @@ def read_gauges(image_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Lit la valeur (0-1) affichee par l'aiguille de 3 "
-                    "manometres sur une photo.")
-    parser.add_argument("image", help="Chemin de l'image en entree")
-    parser.add_argument("--out", default=None,
-                         help="Chemin de l'image annotee de sortie "
-                              "(par defaut: <image>_annotated.jpg)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image")
+    parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     values, vis = read_gauges(args.image)
 
-    print("Valeurs lues (gauche -> droite) :")
     for i, v in enumerate(values):
-        txt = ("%.3f" % v) if v is not None else "non detectee"
-        print("  Capteur " + str(i + 1) + ": " + txt)
+        if v is not None:
+            print(v)
 
     out_path = args.out
     if out_path is None:
@@ -306,8 +217,6 @@ def main():
         else:
             out_path = args.image + "_annotated.jpg"
     cv2.imwrite(out_path, vis)
-    print("")
-    print("Image annotee enregistree : " + out_path)
 
 
 if __name__ == "__main__":
